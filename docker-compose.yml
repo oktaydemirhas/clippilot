@@ -1,14 +1,26 @@
 services:
   clippilot:
     build: .
+    # Published on loopback only: the API has no auth. Put a TLS reverse proxy with auth in front to expose it.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
     volumes:
       - clippilot-data:/data
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
 
 volumes:
   clippilot-data:
