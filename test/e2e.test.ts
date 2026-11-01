@@ -1,20 +1,85 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import http from "node:http";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { FFMPEG, probe, run } from "../src/ffmpeg.js";
+import { FFMPEG, FFPROBE, probe, run } from "../src/ffmpeg.js";
 import { MockProvider } from "../src/llm/mock.js";
+import type { LlmProvider } from "../src/llm/provider.js";
 import { buildServer } from "../src/server.js";
 
 /**
- * Real end-to-end run: real FFmpeg, real HTTP upload, real SSE, real files on disk.
- * Only the LLM is replaced by the deterministic mock.
+ * Real end-to-end runs: real FFmpeg, real HTTP upload, real SSE, real files on disk.
+ * Only the LLM is replaced (by the deterministic mock or a small scripted provider).
  */
+
+const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
+
+interface App {
+  base: string;
+  dataDir: string;
+  close: () => Promise<void>;
+}
+
+async function startApp(tmp: string, name: string, over: Partial<Parameters<typeof buildServer>[0]> = {}): Promise<App> {
+  const dataDir = path.join(tmp, name);
+  const { app } = buildServer({
+    provider: new MockProvider(),
+    dataDir,
+    maxUploadBytes: 50 * 1024 * 1024,
+    publicDir,
+    maxDurationSec: 600,
+    maxConcurrentJobs: 2,
+    maxQueuedJobs: 5,
+    ...over,
+  });
+  const base = await app.listen({ port: 0, host: "127.0.0.1" });
+  return { base, dataDir, close: () => app.close() };
+}
+
+async function upload(base: string, file: string, name: string, type: string): Promise<Response> {
+  const form = new FormData();
+  form.append("video", new Blob([await readFile(file)], { type }), name);
+  return fetch(`${base}/api/videos`, { method: "POST", body: form });
+}
+
+/** The server closes the event stream at done/failed, so reading to the end waits for the job. */
+async function waitForTerminal(base: string, id: string): Promise<string[]> {
+  const text = await (await fetch(`${base}/api/videos/${id}/events`)).text();
+  return [...text.matchAll(/data: (.*)\n\n/g)].map((m) => (JSON.parse(m[1]!) as { stage: string }).stage);
+}
+
+interface JobJson {
+  stage: string;
+  error?: string;
+  result: { hlsUrl: string; clips: { url: string; start: number; end: number }[]; analysis: { chapters: unknown[]; hasSpeech: boolean } };
+}
+
+async function uploadAndWait(app: App, file: string, type = "video/mp4"): Promise<{ id: string; job: JobJson }> {
+  const res = await upload(app.base, file, "x.mp4", type);
+  expect(res.status).toBe(202);
+  const { id } = (await res.json()) as { id: string };
+  await waitForTerminal(app.base, id);
+  return { id, job: (await (await fetch(`${app.base}/api/videos/${id}`)).json()) as JobJson };
+}
+
+/** fetch() normalises `..` away before sending, so traversal has to be tested with a raw request. */
+function rawGet(base: string, rawPath: string): Promise<number> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname, port, path: rawPath, method: "GET" }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 describe("upload -> HLS + analysis + clips", () => {
   let tmp: string;
-  let base: string;
-  let close: () => Promise<void>;
+  let app: App;
   let sample: string;
 
   beforeAll(async () => {
@@ -25,94 +90,214 @@ describe("upload -> HLS + analysis + clips", () => {
       "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", sample,
     ]);
-    const publicDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
-    const { app } = buildServer({
-      provider: new MockProvider(),
-      dataDir: path.join(tmp, "data"),
-      maxUploadBytes: 50 * 1024 * 1024,
-      publicDir,
-    });
-    base = await app.listen({ port: 0, host: "127.0.0.1" });
-    close = () => app.close();
+    app = await startApp(tmp, "data");
   });
 
   afterAll(async () => {
-    await close();
+    await app.close();
     await rm(tmp, { recursive: true, force: true });
   });
 
-  async function upload(file: string, name: string, type: string): Promise<Response> {
-    const form = new FormData();
-    form.append("video", new Blob([await readFile(file)], { type }), name);
-    return fetch(`${base}/api/videos`, { method: "POST", body: form });
-  }
-
-  async function waitForTerminal(id: string): Promise<string[]> {
-    const res = await fetch(`${base}/api/videos/${id}/events`);
-    const text = await res.text(); // the server closes the stream at done/failed
-    return [...text.matchAll(/data: (.*)\n\n/g)].map((m) => (JSON.parse(m[1]!) as { stage: string }).stage);
-  }
-
-  it("streams progress, produces playable HLS, analysis and real clips", async () => {
-    const res = await upload(sample, "lesson.mp4", "video/mp4");
+  it("streams progress, produces playable HLS with ~4 s segments, analysis and real clips", async () => {
+    const res = await upload(app.base, sample, "lesson.mp4", "video/mp4");
     expect(res.status).toBe(202);
     const { id } = (await res.json()) as { id: string };
 
-    const stages = await waitForTerminal(id);
+    const stages = await waitForTerminal(app.base, id);
     expect(stages).toEqual(
       expect.arrayContaining(["queued", "probing", "transcoding", "extracting_audio", "analyzing", "cutting_clips", "done"]),
     );
 
-    const job = (await (await fetch(`${base}/api/videos/${id}`)).json()) as {
-      stage: string;
-      result: { hlsUrl: string; clips: { url: string; start: number; end: number }[]; analysis: { chapters: unknown[] } };
-    };
+    const job = (await (await fetch(`${app.base}/api/videos/${id}`)).json()) as JobJson;
     expect(job.stage).toBe("done");
     expect(job.result.analysis.chapters.length).toBeGreaterThan(0);
 
-    const playlist = await fetch(`${base}${job.result.hlsUrl}`);
+    const playlist = await fetch(`${app.base}${job.result.hlsUrl}`);
     expect(playlist.status).toBe(200);
     const m3u8 = await playlist.text();
-    expect(m3u8).toContain("#EXTM3U");
     expect(m3u8).toContain("#EXT-X-ENDLIST");
+    const durations = [...m3u8.matchAll(/#EXTINF:([\d.]+)/g)].map((m) => Number(m[1]));
+    expect(durations.length).toBeGreaterThanOrEqual(3); // 12 s at 4 s per segment; ~10 s segments would give 2
+    expect(Math.max(...durations)).toBeLessThan(4.6);
+
     const firstSegment = m3u8.split("\n").find((l) => l.endsWith(".ts"))!;
-    const seg = await fetch(`${base}${job.result.hlsUrl.replace("index.m3u8", firstSegment)}`);
+    const seg = await fetch(`${app.base}${job.result.hlsUrl.replace("index.m3u8", firstSegment)}`);
     expect(seg.status).toBe(200);
     expect((await seg.arrayBuffer()).byteLength).toBeGreaterThan(1000);
 
     expect(job.result.clips).toHaveLength(2);
     for (const clip of job.result.clips) {
-      const file = path.join(tmp, "data", id, "clips", path.basename(clip.url));
+      const file = path.join(app.dataDir, id, "clips", path.basename(clip.url));
       expect((await stat(file)).size).toBeGreaterThan(1000);
-      const info = await probe(file);
-      expect(info.durationSec).toBeCloseTo(clip.end - clip.start, 0);
+      expect((await probe(file)).durationSec).toBeCloseTo(clip.end - clip.start, 0);
     }
   });
 
-  it("does not expose the original upload or the extracted audio", async () => {
-    const { id } = (await (await upload(sample, "x.mp4", "video/mp4")).json()) as { id: string };
-    await waitForTerminal(id);
-    expect((await fetch(`${base}/media/${id}/input.mp4`)).status).toBe(404);
-    expect((await fetch(`${base}/media/${id}/audio.mp3`)).status).toBe(404);
-    expect((await fetch(`${base}/media/${id}/hls/../input.mp4`)).status).toBe(404);
+  it("deletes the original upload and the extracted audio once the job has finished", async () => {
+    const { id } = await uploadAndWait(app, sample);
+    const files = await readdir(path.join(app.dataDir, id));
+    expect(files.sort()).toEqual(["clips", "hls"]);
   });
 
-  it("rejects non-video uploads and unknown ids", async () => {
+  it("serves only HLS output and clips, and sends security headers", async () => {
+    const { id } = await uploadAndWait(app, sample);
+    expect((await fetch(`${app.base}/media/${id}/input.bin`)).status).toBe(404);
+    expect((await fetch(`${app.base}/media/${id}/audio.mp3`)).status).toBe(404);
+    // Literal `..` segments, as an attacker would send them (fetch() would normalise these away).
+    expect(await rawGet(app.base, `/media/${id}/hls/../input.bin`)).toBe(404);
+    expect(await rawGet(app.base, `/media/${id}/hls/%2e%2e/input.bin`)).toBe(404);
+    expect(await rawGet(app.base, `/media/${id}/hls/..`)).toBe(404);
+    expect(await rawGet(app.base, `/media/${id}/..%2f..%2fpackage.json`)).toBe(404);
+
+    const page = await fetch(`${app.base}/`);
+    expect(page.headers.get("content-security-policy")).toContain("script-src 'self'");
+    expect(page.headers.get("x-content-type-options")).toBe("nosniff");
+    const hlsJs = await fetch(`${app.base}/vendor/hls.min.js`);
+    expect(hlsJs.status).toBe(200);
+    expect((await hlsJs.text()).length).toBeGreaterThan(100_000);
+  });
+
+  it("rejects declared non-video uploads and unknown ids", async () => {
     const txt = path.join(tmp, "a.txt");
-    await run(FFMPEG, ["-version"]); // sanity: binary runs
-    const { writeFile } = await import("node:fs/promises");
     await writeFile(txt, "hello");
-    expect((await upload(txt, "a.txt", "text/plain")).status).toBe(415);
-    expect((await fetch(`${base}/api/videos/not-an-id`)).status).toBe(404);
+    expect((await upload(app.base, txt, "a.txt", "text/plain")).status).toBe(415);
+    expect((await fetch(`${app.base}/api/videos/not-an-id`)).status).toBe(404);
+  });
+
+  it("fails cleanly, without leaking server paths, when a non-video claims to be video/mp4", async () => {
+    const txt = path.join(tmp, "fake.mp4");
+    await writeFile(txt, "this is not a video");
+    const { job } = await uploadAndWait(app, txt);
+    expect(job.stage).toBe("failed");
+    expect(job.error).toBe("The file could not be read as a video");
+    expect(job.error).not.toMatch(/[\\/]/);
+  });
+
+  it("refuses an HLS playlist disguised as a video instead of following its URLs", async () => {
+    const playlist = path.join(tmp, "evil.mp4");
+    await writeFile(playlist, "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\nhttp://127.0.0.1:9/x.ts\n#EXT-X-ENDLIST\n");
+    const { job } = await uploadAndWait(app, playlist);
+    expect(job.stage).toBe("failed");
+    expect(job.error).not.toContain("127.0.0.1");
+  });
+
+  it("accepts other allowed containers (Matroska)", async () => {
+    const mkv = path.join(tmp, "sample.mkv");
+    await run(FFMPEG, ["-y", "-i", sample, "-c", "copy", mkv]);
+    const { job } = await uploadAndWait(app, mkv, "application/octet-stream");
+    expect(job.stage).toBe("done");
+  });
+
+  it("handles a video with an odd height (libx264 + yuv420p needs even dimensions)", async () => {
+    const odd = path.join(tmp, "odd.mp4");
+    await run(FFMPEG, [
+      "-y", "-f", "lavfi", "-i", "testsrc=duration=12:size=854x480:rate=25",
+      "-f", "lavfi", "-i", "sine=frequency=330:duration=12",
+      "-vf", "crop=854:479",
+      "-c:v", "libx264", "-pix_fmt", "yuv444p", "-c:a", "aac", "-shortest", odd,
+    ]);
+    expect((await probe(odd)).height).toBe(479);
+    const { id, job } = await uploadAndWait(app, odd);
+    expect(job.stage).toBe("done");
+    // Read our own output with plain ffprobe: probe() deliberately refuses MPEG-TS, it is not an upload format.
+    const seg = path.join(app.dataDir, id, "hls", "seg_000.ts");
+    const out = await run(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", seg]);
+    const height = Number(out.trim().split(/\s+/)[0]);
+    expect(height).toBe(478);
   });
 
   it("reports a clear failure for a video without audio", async () => {
     const silent = path.join(tmp, "silent.mp4");
     await run(FFMPEG, ["-y", "-f", "lavfi", "-i", "testsrc=duration=4:size=320x180:rate=25", "-c:v", "libx264", "-pix_fmt", "yuv420p", silent]);
-    const { id } = (await (await upload(silent, "silent.mp4", "video/mp4")).json()) as { id: string };
-    const stages = await waitForTerminal(id);
-    expect(stages.at(-1)).toBe("failed");
-    const job = (await (await fetch(`${base}/api/videos/${id}`)).json()) as { error: string };
+    const { job } = await uploadAndWait(app, silent);
+    expect(job.stage).toBe("failed");
     expect(job.error).toContain("no audio track");
+  });
+});
+
+describe("limits", () => {
+  let tmp: string;
+  let sample: string;
+
+  beforeAll(async () => {
+    tmp = await mkdtemp(path.join(tmpdir(), "clippilot-limits-"));
+    sample = path.join(tmp, "sample.mp4");
+    await run(FFMPEG, [
+      "-y", "-f", "lavfi", "-i", "testsrc=duration=12:size=320x180:rate=25",
+      "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", sample,
+    ]);
+  });
+  afterAll(() => rm(tmp, { recursive: true, force: true }));
+
+  it("rejects a video longer than the duration limit", async () => {
+    const app = await startApp(tmp, "d1", { maxDurationSec: 5 });
+    try {
+      const { job } = await uploadAndWait(app, sample);
+      expect(job.stage).toBe("failed");
+      expect(job.error).toContain("The limit is");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers 413 for an oversized upload and leaves no partial file behind", async () => {
+    const app = await startApp(tmp, "d2", { maxUploadBytes: 1024 * 1024 });
+    try {
+      const big = path.join(tmp, "big.mp4");
+      await writeFile(big, Buffer.alloc(3 * 1024 * 1024, 1));
+      const res = await upload(app.base, big, "big.mp4", "video/mp4");
+      expect(res.status).toBe(413);
+      expect(await readdir(app.dataDir)).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("answers 503 when the worker and the queue are full", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow: LlmProvider = {
+      analyze: async (audio, durationSec) => {
+        await gate;
+        return new MockProvider().analyze(audio, durationSec);
+      },
+      planClips: (a) => new MockProvider().planClips(a),
+    };
+    const app = await startApp(tmp, "d3", { provider: slow, maxConcurrentJobs: 1, maxQueuedJobs: 0 });
+    try {
+      const first = await upload(app.base, sample, "a.mp4", "video/mp4");
+      expect(first.status).toBe(202);
+      const second = await upload(app.base, sample, "b.mp4", "video/mp4");
+      expect(second.status).toBe(503);
+      release();
+      const { id } = (await first.json()) as { id: string };
+      await waitForTerminal(app.base, id);
+    } finally {
+      release();
+      await app.close();
+    }
+  });
+
+  it("runs the whole pipeline for a recording without speech: no quiz, no clips, no forced tool call", async () => {
+    let planned = false;
+    const music: LlmProvider = {
+      analyze: () =>
+        Promise.resolve({ hasSpeech: false, summary: "Instrumental music, no talking.", chapters: [], quiz: [], highlights: [] }),
+      planClips: () => {
+        planned = true;
+        return Promise.resolve([]);
+      },
+    };
+    const app = await startApp(tmp, "d4", { provider: music });
+    try {
+      const { job } = await uploadAndWait(app, sample);
+      expect(job.stage).toBe("done");
+      expect(job.result.analysis.hasSpeech).toBe(false);
+      expect(job.result.clips).toEqual([]);
+      expect(planned).toBe(false);
+    } finally {
+      await app.close();
+    }
   });
 });

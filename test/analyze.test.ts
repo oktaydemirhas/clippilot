@@ -92,6 +92,38 @@ describe("analyzeWithRetry", () => {
     expect(p.feedbackSeen[1]!.join("\n")).toContain("beyond the video duration");
   });
 
+  it("treats a provider that throws or returns garbage as a rejected attempt, not a dead job", async () => {
+    let calls = 0;
+    const flaky: LlmProvider = {
+      analyze: async () => {
+        calls++;
+        if (calls === 1) throw new Error("429 rate limited");
+        if (calls === 2) return "not json at all";
+        return valid(60);
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    const out = await analyzeWithRetry(flaky, audio, 60);
+    expect(out.attempts).toBe(3);
+    expect(out.rejected[0]![0]).toContain("429 rate limited");
+    expect(out.rejected[1]![0]).toContain("expected object");
+  });
+
+  it("sends the previous rejected answer back together with the reasons", async () => {
+    const seenPrevious: unknown[] = [];
+    const bad = { hasSpeech: true, summary: "x", chapters: [], quiz: [], highlights: [] };
+    const p: LlmProvider = {
+      analyze: async (_a, d, _f, previous) => {
+        seenPrevious.push(previous);
+        return seenPrevious.length === 1 ? bad : valid(d);
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    await analyzeWithRetry(p, audio, 60);
+    expect(seenPrevious[0]).toBeUndefined();
+    expect(seenPrevious[1]).toEqual(bad);
+  });
+
   it("gives up after three bad answers instead of looping forever", async () => {
     const p = scripted([{ nope: true }]);
     await expect(analyzeWithRetry(p, audio, 60)).rejects.toThrow(/after 3 attempts/);

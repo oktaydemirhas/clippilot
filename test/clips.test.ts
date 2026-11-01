@@ -33,7 +33,7 @@ describe("executeToolCalls", () => {
         { name: "cut_clip", args: { start: "five", end: 20, title: "A" } },
         { name: "cut_clip", args: { start: 100, end: 120, title: "A" } },
         { name: "cut_clip", args: { start: 10, end: 11, title: "too short" } },
-        { name: "cut_clip", args: { start: 0, end: 59, title: "too long?" } },
+        { name: "cut_clip", args: { start: 0, end: 59, title: "long but legitimate" } },
       ],
       c,
     );
@@ -46,6 +46,31 @@ describe("executeToolCalls", () => {
     // The last call (0-59s) is legitimate and is the only one that reaches FFmpeg.
     expect(clips).toHaveLength(1);
     expect(cuts).toHaveLength(1);
+  });
+
+  it("rejects a clip longer than the maximum even when the video is long enough", async () => {
+    const { ctx: c, cuts } = ctx(600);
+    const { clips, rejected } = await executeToolCalls([{ name: "cut_clip", args: { start: 0, end: 200, title: "too long" } }], c);
+    expect(clips).toEqual([]);
+    expect(cuts).toEqual([]);
+    expect(rejected[0]!.reason).toContain("must be between");
+  });
+
+  it("keeps going when one cut fails instead of throwing the whole job away", async () => {
+    const calls = [
+      { name: "cut_clip", args: { start: 0, end: 10, title: "a" } },
+      { name: "cut_clip", args: { start: 20, end: 30, title: "b" } },
+    ];
+    let n = 0;
+    const flaky = {
+      durationSec: 60,
+      clipsDir: "clips",
+      cut: () => (n++ === 0 ? Promise.reject(new Error("ffmpeg exploded")) : Promise.resolve()),
+    };
+    const { clips, rejected } = await executeToolCalls(calls, flaky);
+    expect(clips.map((c) => c.title)).toEqual(["b"]);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toBe("the clip could not be cut");
   });
 
   it("clamps an end time past the video to the video duration", async () => {
