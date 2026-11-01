@@ -1,0 +1,14 @@
+services:
+  clippilot:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+    volumes:
+      - clippilot-data:/data
+
+volumes:
+  clippilot-data:
