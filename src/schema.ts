@@ -3,20 +3,37 @@ import { z } from "zod";
 export const AnalysisSchema = z.object({
   /** False for music, silence or ambient sound: then chapters, quiz and highlights must be empty. */
   hasSpeech: z.boolean(),
-  summary: z.string().min(1),
-  chapters: z.array(z.object({ start: z.number().min(0), title: z.string().min(1), summary: z.string().min(1) })),
-  quiz: z.array(
-    z.object({
-      at: z.number().min(0),
-      question: z.string().min(1),
-      options: z.array(z.string().min(1)).length(4),
-      answerIndex: z.number().int().min(0).max(3),
-      explanation: z.string().min(1),
-    }),
-  ),
-  highlights: z.array(
-    z.object({ start: z.number().min(0), end: z.number().min(0), title: z.string().min(1), reason: z.string() }),
-  ),
+  summary: z.string().min(1).max(2000),
+  chapters: z
+    .array(
+      z.object({
+        start: z.number().min(0),
+        title: z.string().min(1).max(200),
+        summary: z.string().min(1).max(1000),
+      }),
+    )
+    .max(40),
+  quiz: z
+    .array(
+      z.object({
+        at: z.number().min(0),
+        question: z.string().min(1).max(500),
+        options: z.array(z.string().min(1).max(300)).length(4),
+        answerIndex: z.number().int().min(0).max(3),
+        explanation: z.string().min(1).max(1000),
+      }),
+    )
+    .max(10),
+  highlights: z
+    .array(
+      z.object({
+        start: z.number().min(0),
+        end: z.number().min(0),
+        title: z.string().min(1).max(200),
+        reason: z.string().max(500),
+      }),
+    )
+    .max(10),
 });
 export type Analysis = z.infer<typeof AnalysisSchema>;
 

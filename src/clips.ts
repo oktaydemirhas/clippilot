@@ -57,7 +57,14 @@ export async function executeToolCalls(
       continue;
     }
     const file = `clip-${clips.length + 1}.mp4`;
-    await ctx.cut(path.join(ctx.clipsDir, file), start, end);
+    try {
+      await ctx.cut(path.join(ctx.clipsDir, file), start, end);
+    } catch (err) {
+      // One bad cut must not throw away the HLS output and the analysis that already succeeded.
+      console.error("clip cut failed:", err);
+      rejected.push({ call, reason: "the clip could not be cut" });
+      continue;
+    }
     clips.push({ title, start, end, file });
   }
   return { clips, rejected };

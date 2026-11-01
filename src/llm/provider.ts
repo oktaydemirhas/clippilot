@@ -15,7 +15,10 @@ export interface ToolCall {
  * the pipeline, not the provider, decides whether to trust it.
  */
 export interface LlmProvider {
-  analyze(audio: AudioInput, durationSec: number, feedback: string[]): Promise<unknown>;
-  /** Agentic step: the model decides which clips to cut by calling the `cut_clip` tool. */
+  analyze(audio: AudioInput, durationSec: number, feedback: string[], previous?: unknown): Promise<unknown>;
+  /**
+   * Second model call: given the highlight candidates, the model picks and trims clips by calling the
+   * `cut_clip` tool. It sees the first call's output, not the audio.
+   */
   planClips(analysis: Analysis, durationSec: number): Promise<ToolCall[]>;
 }

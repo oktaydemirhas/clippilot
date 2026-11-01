@@ -32,7 +32,6 @@ export interface JobResult {
 
 export interface Job {
   id: string;
-  filename: string;
   stage: Stage;
   events: JobEvent[];
   result?: JobResult;
@@ -45,8 +44,9 @@ export class JobStore {
   private readonly jobs = new Map<string, Job>();
   readonly bus = new EventEmitter();
 
-  create(id: string, filename: string): Job {
-    const job: Job = { id, filename, stage: "queued", events: [] };
+  /** The original file name is deliberately not stored: it can contain personal data and nothing needs it. */
+  create(id: string): Job {
+    const job: Job = { id, stage: "queued", events: [] };
     this.jobs.set(id, job);
     this.push(job, "queued", "Upload received");
     return job;
@@ -54,6 +54,11 @@ export class JobStore {
 
   get(id: string): Job | undefined {
     return this.jobs.get(id);
+  }
+
+  delete(id: string): void {
+    this.jobs.delete(id);
+    this.bus.removeAllListeners(`job:${id}`);
   }
 
   update(id: string, stage: Stage, message: string): void {
