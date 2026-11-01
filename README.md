@@ -3,16 +3,16 @@
 Upload an educational video. ClipPilot turns it into:
 
 - **HLS streaming** (FFmpeg, 720p max, played with hls.js)
-- **AI chapters and summary**
-- **An in-video quiz**: the player pauses at the right second and asks a question about what was just explained
-- **Highlight clips**, cut automatically: the model decides what to cut by *calling a tool*, and the backend validates every call before FFmpeg runs
+- **AI chapters and a summary**
+- **An in-video quiz.** The player pauses at the timestamp the model gave for each question. The code checks that the timestamp is inside the video, not that it is the right moment (see "Known limits").
+- **Highlight clips**, cut automatically. The model proposes highlights, a second model call picks and trims them by calling a `cut_clip` tool, and the backend validates every call before FFmpeg runs.
 
-I built it as a prototype for the SAAT Teknoloji *New Product Developer* role, around what I know best: five years of making interactive learning video (Cinema8).
+It is a prototype for the SAAT Teknoloji *New Product Developer* role, built around what I know best: five years of making interactive learning video.
 
 ## How it works
 
 ```
-POST /api/videos  ->  202 { id }
+POST /api/videos  ->  202 { id }            (503 when the queue is full, 413 when too large)
                        |
         probe -> transcode to HLS -> extract audio -> LLM analysis -> LLM picks clips -> FFmpeg cuts
                        |
@@ -21,21 +21,23 @@ GET  /api/videos/:id          (job state + result)
 GET  /media/:id/hls/...       (playlist + segments)   GET /media/:id/clips/...   (mp4 clips)
 ```
 
-- **Node 22 + TypeScript (strict) + Fastify.** FFmpeg runs through `spawn`, never `execSync`, so a long encode does not block other requests.
-- **The LLM sits behind an interface** (`src/llm/provider.ts`). `GeminiProvider` sends the extracted audio to Gemini and gets chapters, quiz and highlights back. `MockProvider` is deterministic and is what the tests use.
-- **Model output is never trusted** (`src/analyze.ts`, `src/schema.ts`). Every answer must pass a zod schema *and* semantic checks (timestamps inside the video, chapters in order, clip lengths sane). A rejected answer goes back to the model with the exact reasons, up to 3 attempts.
-- **Tool calls are validated too** (`src/clips.ts`). The model may only call `cut_clip`; its arguments are checked for bounds, length and count before anything reaches FFmpeg. Rejections are reported, not silently dropped.
-- **Only HLS output and clips are public.** The original upload and the extracted audio cannot be fetched (tested).
+- **Node 22 + TypeScript (strict) + Fastify.** FFmpeg runs through `spawn` with a timeout and `SIGKILL`, never `execSync`, so an encode does not block the event loop.
+- **The LLM sits behind an interface** (`src/llm/provider.ts`). `GeminiProvider` sends the extracted audio to Gemini and gets chapters, quiz and highlights back. `MockProvider` is deterministic and is what most tests use. A fake-SDK test covers `GeminiProvider` itself.
+- **Model output is never trusted** (`src/analyze.ts`, `src/schema.ts`). Every answer must pass a zod schema *and* semantic checks (timestamps inside the video, chapters in order, clip lengths sane, no quiz when there is no speech). The JSON Schema generated from the zod schema is also enforced by the Gemini API. A rejected answer goes back to the model together with the rejected JSON and the exact reasons, up to 3 attempts. A provider that throws or returns text that is not JSON counts as a rejected attempt, so one retry policy covers everything.
+- **Tool calls are validated too** (`src/clips.ts`). The model may only call `cut_clip`; its arguments are checked for bounds, length and count before anything reaches FFmpeg. Rejections are reported, and one failed cut does not fail the whole job. The second model call only sees the first call's highlight list (not the audio), so it is a re-ranking and trimming step, not an autonomous agent loop. The mock does not simulate function calling.
+- **Untrusted uploads.** The file name is never used on disk. FFmpeg and ffprobe run with a protocol whitelist (`file` only) and a demuxer whitelist (MP4/MOV/MKV/WebM/AVI), so an HLS playlist disguised as a video is refused instead of followed. The original upload and the extracted audio are deleted when a job ends, partial uploads are removed, and only HLS files and clips with server-generated names are public.
+- **Limits** (`.env.example`): upload size, video length (45 min default), one job at a time with a short queue (503 when full), 4K pixel cap, FFmpeg and model-call timeouts, job directories deleted after 24 h. The server listens on loopback by default.
+- **Self-hosted hls.js and a strict CSP**, no inline scripts, model text is only ever rendered with `textContent`.
 
 ## Run it
 
 ```bash
 npm install
 cp .env.example .env        # add GEMINI_API_KEY, or set LLM_PROVIDER=mock
-npm run dev                 # http://localhost:3000
+npm run dev                 # http://127.0.0.1:3000
 ```
 
-Docker: `docker compose up --build` (set `GEMINI_API_KEY` in your shell or `.env`).
+Docker: `docker compose up --build` (set `GEMINI_API_KEY` in your shell or `.env`). The image uses Debian's patched FFmpeg instead of the bundled binaries.
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -45,41 +47,65 @@ npm run lint && npm run typecheck && npm test
 
 | Check | Status |
 | --- | --- |
-| Lint, typecheck, 14 tests | passing |
-| Real FFmpeg end to end: upload -> HLS playlist and segments -> clips with the expected duration (mock LLM) | passing, in the test suite |
-| SSE progress, 415 on non-video, 404 on unknown id, failure message for a video with no audio | passing, in the test suite |
-| HLS playback and quiz pause in a real browser | checked manually (Chromium, mock LLM) |
-| Real Gemini (`gemini-3.5-flash-lite`) on a 63 s spoken lesson: transcript-based chapters, quiz, function-calling clip cut, clip file probed at the expected 47 s | passing in one manual run (see "Evaluation" for what is still thin) |
-| `docker build` | **not yet run** locally (no Docker on my dev machine); runs in CI |
+| Lint, typecheck, 42 tests | passing locally (Windows, Node 24) |
+| Real FFmpeg end to end: upload -> HLS (4 s segments) -> clips with the expected duration, odd-height video, Matroska, no-speech recording, no-audio video (mock LLM) | in the test suite |
+| Attacks: literal `..` paths (raw HTTP, not `fetch`), disguised HLS playlist, text file claiming `video/mp4`, oversize upload leaves no partial file, queue full -> 503 | in the test suite |
+| `GeminiProvider` against a fake SDK: parse failure and empty reply are returned, not thrown; retry prompt contains the previous answer; tool-call mapping | in the test suite |
+| HLS playback under the CSP in a real browser (Chromium, mock LLM) | checked manually once |
+| Real Gemini (`gemini-3.5-flash-lite`) on three videos | see "Evaluation" |
+| GitHub Actions workflow | written, **never run** (the repo has not been pushed yet) |
+| `docker build` and the compose hardening (`read_only`, `cap_drop`) | **never run**: no Docker on my machine |
 
 ## Evaluation
 
-Real runs with `gemini-3.5-flash-lite`, 240p Creative Commons YouTube videos (not included in this repo). Small sample, one run each, so read these as findings, not statistics.
+Real runs with `gemini-3.5-flash-lite` on 240p Creative Commons YouTube videos (not in this repo). One run per row, so these are findings, not statistics. Times include transcoding.
 
-| Video | Length | Result | Notes |
+| Video | Length | First run (early version) | Re-run after the fixes below |
 | --- | --- | --- | --- |
-| Turkish intro to Python (talk) | 2:39 | done, 1st answer valid, 58 s | Turkish chapters, quiz and summary, content-specific. Two highlights were proposed and the clip planner chose to cut one (no tool call was rejected). |
-| Turkish Python-grammar demo (screencast, probably no narration) | 5:16 | done, 1st answer valid, 28 s | Model reported "instrumental, no speech". I did not listen to confirm. It still produced a one-question quiz about the audio type, which a product should refuse instead. Fixed: see "no speech" below. |
-| Turkish course lesson | 16:52 | **failed** after 3 attempts, 202 s | The model kept returning quiz timestamps past the end of the video (`at=1220`, video is 1011 s). The semantic check caught it every time; the model never fixed it. |
+| Turkish intro to Python (talk) | 2:39 | done, 58 s, 1 attempt, 1 clip | done, 32 s, 2 attempts, 2 clips |
+| Turkish Python-grammar demo (screencast, probably no narration) | 5:16 | done, 28 s, but it made a quiz about the audio type | done, 25 s, 1 attempt, no quiz, no clips, summary says "only background music" |
+| Turkish course lesson | 16:52 | **failed** after 3 attempts, 202 s: quiz timestamps past the end of the video (`at=1220`, video is 1011 s) | done, 179 s, 2 attempts, 2 clips |
 
-What these runs changed:
+What these runs showed, in the order I found it:
 
-- Before: the JSON shape lived only in the prompt. 2 of 3 videos failed with missing `highlights` fields, and the one that passed was generic, in English, with round timestamps for a Turkish video. After: the JSON Schema generated from the zod schema is enforced by the API (`responseJsonSchema`), and the same short videos validated on the first try.
-- Likely fix for the long-audio drift: analyse the audio in chunks of a few minutes and merge with offsets. Not built yet.
-- No speech: the analysis now carries `hasSpeech`. When it is false, chapters, quiz and highlights must be empty (checked, and the reasons are fed back on retry) and no clips are cut. Re-run on the screencast above: 33 s, no quiz, no clips, summary says "only music".
-- Output varies between runs. The same 2:39 video took 1 attempt and cut 1 clip in the first run, then 2 attempts and 2 clips in the second. I have not measured how often this happens.
-- Open problem: timestamps drift on long audio (see the 16 min row).
+1. Early on, the JSON shape lived only in the prompt. Two of three videos failed with missing `highlights` fields, and the one that passed was generic, in English, with round timestamps for a Turkish video. The API now enforces the JSON Schema generated from the zod schema.
+2. The screencast had no speech, and the system made up a quiz anyway. The analysis now carries `hasSpeech`; when it is false the lists must be empty and no clips are cut.
+3. On the 16 min video the retry loop only sent the rejection reasons back, not the rejected answer, and it failed three times. It now sends both, and the same video passed on attempt 2. That is one run, so I cannot say the change is the cause.
+4. Adding length limits to the zod schema made the live API return a bare `400 INVALID_ARGUMENT` on every request, while all tests still passed (the fake SDK accepts anything). Bisecting against the real API showed Gemini rejects `maxLength` and `maxItems` in `responseJsonSchema`. They are stripped before sending, zod still enforces them, and a test now guards it.
+
+Output varies between runs: the same 2:39 video produced 1 clip in the first run and 2 in the second. I have not measured how often.
+
+## Independent review
+
+Before publishing I had two AI agents review the repo in fresh sessions with no context: a general code and architecture review and a security audit. They found real problems, which I checked and fixed where cheap:
+
+- Fixed and verified: the retry loop did not cover non-JSON or empty replies; no timeouts; no concurrency limit; odd video heights crashed the encoder (reproduced: `height not divisible by 2`); HLS segments were ~10 s instead of 4 s (reproduced); partial uploads and originals were never deleted; no duration or resolution cap; FFmpeg ran with every protocol and demuxer; server paths leaked into error messages; hls.js came from a CDN without integrity checks; no security headers; unvalidated config; one failed cut failed the job.
+- Also found: my own earlier traversal test was vacuous (`fetch` normalises `..` before sending), the README claimed the retry covered every bad answer, and the "no speech" and "responseJsonSchema" fixes appear in the first commits although I made them after the first Gemini runs. All three are corrected here.
+- Left on purpose, see "Known limits".
+
+An AI review is not a human review, and it is not a guarantee.
+
+## Known limits
+
+- **No authentication and no rate limiting.** Anyone who can reach the port can spend CPU and model calls. It listens on loopback by default; behind a reverse proxy you would add auth, TLS and a per-IP limit. There is no cost cap on model calls.
+- **Videos are limited to 45 minutes** because the audio is sent inline in one request. Long audio needs chunking with timestamp offsets or the Gemini Files API; not built.
+- **Timestamp correctness is not measured.** I check that timestamps are inside the video and ordered, not that a quiz question appears right after the answer was explained. On one video it looked slightly early.
+- **Small evaluation**: three videos, one run each, all Turkish. No English, no noisy audio, nothing over 17 minutes.
+- Jobs live in memory and are lost on restart; media links are secret UUID URLs that stay valid until the job directory is deleted (24 h).
+- Local development uses `ffmpeg-static` and `ffprobe-static`, which ship old builds (ffprobe 4.0.2 from 2018). The Docker image uses Debian's FFmpeg.
+- CI actions are pinned to tags, not commit SHAs. `npm audit` reports three moderate findings in `@fastify/static`'s dependencies (`glob`, `minimatch`); not reachable here, and `npm audit fix --force` would downgrade the package.
+- RTMP/live ingest, RAG over a library of videos, multiple HLS renditions: out of scope.
 
 ## Working with AI
 
-I built this with an AI coding assistant and treated its output as untrusted. Things the checks caught while building:
+I built this with an AI coding assistant and treated its output as untrusted. What the checks caught:
 
 - `tsc` rejected my first `ffmpeg-static` import: its type declaration is a namespace, but at runtime it is a path string. Fixed with an explicit, commented cast.
-- On the first real Gemini run the model's first answer was **rejected by the schema** (`highlights.0.reason` missing). The retry loop sent that exact reason back and the second answer validated. This is the case the mocks were written to cover, and it happened for real.
-- A test I generated asserted a list that silently ignored its last element. I rewrote it so every expectation matches a real case.
+- On the first real Gemini run the model's answer was **rejected by the schema** (`highlights.0.reason` missing). The retry loop sent the reason back and the second answer validated.
+- A test the assistant generated asserted a list that silently ignored its last element; another claimed to test path traversal but `fetch` had already removed the `..`. Both were rewritten.
+- The assistant's own README claimed more than the code did (retry "up to 3 attempts" for every bad answer, "transcript-based", "agentic"). The review found it and the wording above is what remains true.
+- A schema change passed every test and the live API still returned 400. Mocks and fakes cannot tell you what a real service rejects, so every change to a model call now gets one real run.
 
-_Add your own: anything else that went wrong and how you caught it._
+## Git history
 
-## Not in scope (on purpose)
-
-RTMP/live ingest, RAG over a library of videos, auth, a job queue with persistence (jobs live in memory), multiple HLS renditions. Each is a clear next step, none is needed to show the core idea.
+The commits were written after the code, as logical groups, not in the order things happened. The order in which problems were found is in "Evaluation".
