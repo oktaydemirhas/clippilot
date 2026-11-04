@@ -97,16 +97,66 @@ describe("analyzeWithRetry", () => {
     const flaky: LlmProvider = {
       analyze: async () => {
         calls++;
-        if (calls === 1) throw new Error("429 rate limited");
+        if (calls === 1) throw Object.assign(new Error("quota exceeded for project 123 at /data/x/audio.mp3"), { status: 429 });
         if (calls === 2) return "not json at all";
         return valid(60);
       },
       planClips: () => Promise.resolve([]),
     };
-    const out = await analyzeWithRetry(flaky, audio, 60);
+    const out = await analyzeWithRetry(flaky, audio, 60, { baseDelayMs: 0 });
     expect(out.attempts).toBe(3);
-    expect(out.rejected[0]![0]).toContain("429 rate limited");
+    expect(out.rejected[0]![0]).toContain("HTTP 429");
     expect(out.rejected[1]![0]).toContain("expected object");
+  });
+
+  it("keeps the raw provider error out of the job record: it can hold server paths or API response bodies", async () => {
+    let calls = 0;
+    const flaky: LlmProvider = {
+      analyze: async () => {
+        if (++calls === 1) throw new Error("ENOENT: no such file /srv/clippilot/data/abc/audio.mp3");
+        return valid(60);
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    const out = await analyzeWithRetry(flaky, audio, 60, { baseDelayMs: 0 });
+    expect(JSON.stringify(out.rejected)).not.toContain("/srv/");
+  });
+
+  it("backs off exponentially after failed requests, but retries a rejected answer at once", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const p: LlmProvider = {
+      analyze: async () => {
+        calls++;
+        if (calls <= 2) throw Object.assign(new Error("unavailable"), { status: 503 });
+        return valid(60);
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    await analyzeWithRetry(p, audio, 60, { baseDelayMs: 100, sleep: (ms) => (waits.push(ms), Promise.resolve()) });
+    expect(waits).toHaveLength(2);
+    expect(waits[0]!).toBeGreaterThanOrEqual(100);
+    expect(waits[0]!).toBeLessThan(150);
+    expect(waits[1]!).toBeGreaterThanOrEqual(200); // doubled
+
+    const noWait: number[] = [];
+    await analyzeWithRetry(scripted([{ nope: true }, await valid(60)]), audio, 60, {
+      sleep: (ms) => (noWait.push(ms), Promise.resolve()),
+    });
+    expect(noWait).toEqual([]); // a bad answer is not a server problem, so no waiting
+  });
+
+  it("fails at once on a client error such as a bad API key instead of burning three requests", async () => {
+    let calls = 0;
+    const p: LlmProvider = {
+      analyze: () => {
+        calls++;
+        return Promise.reject(Object.assign(new Error("API key not valid"), { status: 401 }));
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    await expect(analyzeWithRetry(p, audio, 60, { baseDelayMs: 0 })).rejects.toThrow("API key not valid");
+    expect(calls).toBe(1);
   });
 
   it("sends the previous rejected answer back together with the reasons", async () => {

@@ -23,10 +23,10 @@ GET  /media/:id/hls/...       (playlist + segments)   GET /media/:id/clips/...  
 
 - **Node 22 + TypeScript (strict) + Fastify.** FFmpeg runs through `spawn` with a timeout and `SIGKILL`, never `execSync`, so an encode does not block the event loop.
 - **The LLM sits behind an interface** (`src/llm/provider.ts`). `GeminiProvider` sends the extracted audio to Gemini and gets chapters, quiz and highlights back. `MockProvider` is deterministic and is what most tests use. A fake-SDK test covers `GeminiProvider` itself.
-- **Model output is never trusted** (`src/analyze.ts`, `src/schema.ts`). Every answer must pass a zod schema *and* semantic checks (timestamps inside the video, chapters in order, clip lengths sane, no quiz when there is no speech). The JSON Schema generated from the zod schema is also enforced by the Gemini API. A rejected answer goes back to the model together with the rejected JSON and the exact reasons, up to 3 attempts. A provider that throws or returns text that is not JSON counts as a rejected attempt, so one retry policy covers everything.
-- **Tool calls are validated too** (`src/clips.ts`). The model may only call `cut_clip`; its arguments are checked for bounds, length and count before anything reaches FFmpeg. Rejections are reported, and one failed cut does not fail the whole job. The second model call only sees the first call's highlight list (not the audio), so it is a re-ranking and trimming step, not an autonomous agent loop. The mock does not simulate function calling.
-- **Untrusted uploads.** The file name is never used on disk. FFmpeg and ffprobe run with a protocol whitelist (`file` only) and a demuxer whitelist (MP4/MOV/MKV/WebM/AVI), so an HLS playlist disguised as a video is refused instead of followed. The original upload and the extracted audio are deleted when a job ends, partial uploads are removed, and only HLS files and clips with server-generated names are public.
-- **Limits** (`.env.example`): upload size, video length (45 min default), one job at a time with a short queue (503 when full), 4K pixel cap, FFmpeg and model-call timeouts, job directories deleted after 24 h. The server listens on loopback by default.
+- **Model output is never trusted** (`src/analyze.ts`, `src/schema.ts`). Every answer must pass a zod schema *and* semantic checks (timestamps inside the video, chapters in order, clip lengths sane, no quiz when there is no speech). The JSON Schema generated from the zod schema is also enforced by the Gemini API. A rejected answer goes back to the model together with the rejected JSON and the exact reasons, up to 3 attempts. A provider that throws or returns text that is not JSON counts as a rejected attempt. Failed requests (network, timeout, 429, 5xx) wait with exponential backoff and jitter; a 4xx such as a bad API key fails at once instead of burning three requests. The raw provider error is only logged: it can contain server paths or API response bodies.
+- **Tool calls are validated too** (`src/clips.ts`). The model may only call `cut_clip`; its arguments are checked for bounds, length and count before anything reaches FFmpeg. Rejections are reported, and neither a failed cut nor a failed second model call (rate limit, timeout) fails the whole job: the HLS output and the analysis are kept. The second model call only sees the first call's highlight list (not the audio), so it is a re-ranking and trimming step, not an autonomous agent loop. The mock does not simulate function calling.
+- **Untrusted uploads.** The file name is never used on disk. FFmpeg and ffprobe run with a protocol whitelist (`file` only) and a demuxer whitelist (MP4/MOV/MKV/WebM/AVI), so an HLS playlist disguised as a video is refused as a format. (FFmpeg already blocks `http` inside a playlist opened from a file by default; the whitelists make that explicit and add the format check.) FFmpeg is told which streams to use (`-map 0:V:0 -map 0:a:0`), because by default it prefers the largest video stream while the resolution cap looks at the first one, and output is cut at the probed duration (`-t`), because a header can claim less than the file holds. The original upload and the extracted audio are deleted when a job ends, partial uploads are removed, and only HLS files and clips with server-generated names are public.
+- **Limits** (`.env.example`): upload size, video length (45 min default), one job at a time with a short queue (503 when full; uploads still streaming in count against it), one file and no text fields per upload, 4K pixel cap, FFmpeg and model-call timeouts, job directories deleted after 24 h (only directories whose name is a job id). The server listens on loopback by default, answers only to loopback `Host` names (DNS rebinding; add yours with `ALLOWED_HOSTS`), and refuses POSTs from another origin.
 - **Self-hosted hls.js and a strict CSP**, no inline scripts, model text is only ever rendered with `textContent`.
 
 ## Run it
@@ -47,9 +47,10 @@ npm run lint && npm run typecheck && npm test
 
 | Check | Status |
 | --- | --- |
-| Lint, typecheck, 42 tests | passing locally (Windows, Node 24) |
+| Lint, typecheck, 51 tests | passing locally (Windows, Node 24) |
 | Real FFmpeg end to end: upload -> HLS (4 s segments) -> clips with the expected duration, odd-height video, Matroska, no-speech recording, no-audio video (mock LLM) | in the test suite |
-| Attacks: literal `..` paths (raw HTTP, not `fetch`), disguised HLS playlist, text file claiming `video/mp4`, oversize upload leaves no partial file, queue full -> 503 | in the test suite |
+| Attacks: literal `..` paths (raw HTTP, not `fetch`), disguised HLS playlist (a local listener receives zero requests), a hidden 4K second video stream, text file claiming `video/mp4`, oversize upload leaves no partial file, queue full -> 503 (also for parallel uploads), foreign `Host` / `Origin` -> 403 | in the test suite |
+| Retry policy: backoff, fail-fast on 401, raw provider text kept out of the job record; a failing `planClips` keeps the finished job | in the test suite |
 | `GeminiProvider` against a fake SDK: parse failure and empty reply are returned, not thrown; retry prompt contains the previous answer; tool-call mapping | in the test suite |
 | HLS playback under the CSP in a real browser (Chromium, mock LLM) | checked manually once |
 | Real Gemini (`gemini-3.5-flash-lite`) on three videos | see "Evaluation" |
@@ -59,7 +60,7 @@ npm run lint && npm run typecheck && npm test
 
 ## Evaluation
 
-Real runs with `gemini-3.5-flash-lite` on 240p Creative Commons YouTube videos (not in this repo). One run per row, so these are findings, not statistics. Times include transcoding.
+Real runs with `gemini-3.5-flash-lite` on 240p Creative Commons YouTube videos (not in this repo). One run per row, so these are findings, not statistics. Times include transcoding. I did not save the raw outputs, so you cannot check these numbers from the repo; `node scripts/eval.mjs <video>...` runs the same measurement against a running server and prints the summary as JSON.
 
 | Video | Length | First run (early version) | Re-run after the fixes below |
 | --- | --- | --- | --- |
@@ -84,6 +85,13 @@ Before publishing I had two AI agents review the repo in fresh sessions with no 
 - Also found: my own earlier traversal test was vacuous (`fetch` normalises `..` before sending), the README claimed the retry covered every bad answer, and the "no speech" and "responseJsonSchema" fixes appear in the first commits although I made them after the first Gemini runs. All three are corrected here.
 - Left on purpose, see "Known limits".
 
+A second round on the fixed code (two fresh agents, an Opus general review and a security audit with a git-history secret scan) found more:
+
+- Fixed and verified by a test that fails without the fix: a second, larger video stream bypassed the 4K cap (FFmpeg picked it, the probe did not look at it); parallel uploads all passed the queue check before any was queued; a failing second model call threw away a finished job; the janitor would delete any old entry in `DATA_DIR`, not just job directories.
+- Fixed with a test: raw provider errors (server paths, API bodies) reached the job record; every error was retried immediately three times, including a bad API key.
+- Fixed without a dedicated test: multipart text fields were buffered in memory; clips were not capped at 720p; the frontend leaked a player per upload, polled forever on a 404, and threw on a non-JSON error; the mock failed videos under 7.5 s; `npm audit` was out of date (`npm audit fix`, no `--force`, now reports 0 for production dependencies); output is cut at the probed duration (`-t`).
+- The history scan found no keys, tokens or local paths in any commit.
+
 An AI review is not a human review, and it is not a guarantee.
 
 ## Known limits
@@ -94,7 +102,8 @@ An AI review is not a human review, and it is not a guarantee.
 - **Small evaluation**: three videos, one run each, all Turkish. No English, no noisy audio, nothing over 17 minutes.
 - Jobs live in memory and are lost on restart; media links are secret UUID URLs that stay valid until the job directory is deleted (24 h).
 - Local development uses `ffmpeg-static` and `ffprobe-static`, which ship old builds (ffprobe 4.0.2 from 2018). The Docker image uses Debian's FFmpeg.
-- CI actions are pinned to tags, not commit SHAs. `npm audit` reports three moderate findings in `@fastify/static`'s dependencies (`glob`, `minimatch`); not reachable here, and `npm audit fix --force` would downgrade the package.
+- CI actions and Docker base images are pinned to tags, not commit SHAs or digests, and the checkout step keeps its token. `npm audit --omit=dev` reports no findings today; that can change.
+- A model call that works with inline audio can still hit the API's request size limit: 45 minutes of audio is about 11 MB, the cap in code is 14 MiB, and base64 adds a third.
 - RTMP/live ingest, RAG over a library of videos, multiple HLS renditions: out of scope.
 
 ## Working with AI

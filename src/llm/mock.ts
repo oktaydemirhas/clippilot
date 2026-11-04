@@ -26,8 +26,9 @@ export class MockProvider implements LlmProvider {
         },
       ],
       highlights: [
-        { start: d * 0.1, end: Math.min(d * 0.1 + len, d), title: "First highlight", reason: "mock" },
-        { start: d * 0.6, end: Math.min(d * 0.6 + len, d), title: "Second highlight", reason: "mock" },
+        // Start early enough that the whole clip fits: a truncated one on a short video would be under the minimum.
+        { start: Math.min(d * 0.1, d - len), end: Math.min(d * 0.1, d - len) + len, title: "First highlight", reason: "mock" },
+        { start: Math.min(d * 0.6, d - len), end: Math.min(d * 0.6, d - len) + len, title: "Second highlight", reason: "mock" },
       ],
     };
     return Promise.resolve(analysis);

@@ -49,10 +49,10 @@ export async function runPipeline(id: string, inputFile: string, deps: PipelineD
     const encodeTimeoutMs = Math.max(120_000, info.durationSec * 2000);
 
     store.update(id, "transcoding", "Transcoding to HLS (720p max)");
-    await transcodeToHls(inputFile, path.join(dir, "hls"), encodeTimeoutMs);
+    await transcodeToHls(inputFile, path.join(dir, "hls"), encodeTimeoutMs, info.durationSec);
 
     store.update(id, "extracting_audio", "Extracting audio for the model");
-    await extractAudio(inputFile, audioFile, encodeTimeoutMs);
+    await extractAudio(inputFile, audioFile, encodeTimeoutMs, info.durationSec);
     if ((await stat(audioFile)).size > MAX_INLINE_AUDIO_BYTES) {
       throw new UserError("The audio is too large to analyse in one request");
     }
@@ -68,12 +68,20 @@ export async function runPipeline(id: string, inputFile: string, deps: PipelineD
     // With no speech or no candidates there is nothing to choose from; a forced tool call would invent a clip.
     if (outcome.analysis.hasSpeech && outcome.analysis.highlights.length > 0) {
       store.update(id, "cutting_clips", "The model is choosing clips to cut (tool calls)");
-      const calls = await provider.planClips(outcome.analysis, info.durationSec);
-      ({ clips, rejected } = await executeToolCalls(calls, {
-        durationSec: info.durationSec,
-        clipsDir: path.join(dir, "clips"),
-        cut: (out, start, end) => cutClip(inputFile, out, start, end),
-      }));
+      try {
+        const calls = await provider.planClips(outcome.analysis, info.durationSec);
+        ({ clips, rejected } = await executeToolCalls(calls, {
+          durationSec: info.durationSec,
+          clipsDir: path.join(dir, "clips"),
+          cut: (out, start, end) => cutClip(inputFile, out, start, end),
+        }));
+      } catch (err) {
+        // The clips are a bonus. A rate limit or timeout on this second model call must not throw away
+        // the HLS output and the analysis that already succeeded.
+        console.error(`job ${id}: planning clips failed:`, err);
+        clips = [];
+        rejected = [{ call: { name: "plan_clips", args: {} }, reason: "the model could not plan clips" }];
+      }
     }
 
     store.complete(id, {

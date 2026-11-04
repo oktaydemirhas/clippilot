@@ -92,14 +92,25 @@ export async function probe(file: string): Promise<MediaInfo> {
   };
 }
 
+/**
+ * Which streams FFmpeg works on. Without -map it would pick the highest-resolution video stream, while
+ * probe() checked the first one: a file could hide a huge second stream behind a tiny first one.
+ * `V` (capital) skips cover-art pictures, matching what probe() counts as video.
+ */
+const MAP_FIRST_STREAMS = ["-map", "0:V:0", "-map", "0:a:0"];
+
+/** Output cap: the container header's duration is a claim, not a guarantee. */
+const capSeconds = (durationSec: number): string[] => ["-t", String(Math.ceil(durationSec) + 1)];
+
 /** Single-rendition VOD HLS capped at 720p. Returns the playlist path. */
-export async function transcodeToHls(input: string, outDir: string, timeoutMs?: number): Promise<string> {
+export async function transcodeToHls(input: string, outDir: string, timeoutMs?: number, durationSec?: number): Promise<string> {
   await mkdir(outDir, { recursive: true });
   const playlist = path.join(outDir, "index.m3u8");
   await run(
     FFMPEG,
     [
-      "-y", ...UNTRUSTED_INPUT, "-i", input,
+      "-y", ...UNTRUSTED_INPUT, "-i", input, ...MAP_FIRST_STREAMS,
+      ...(durationSec ? capSeconds(durationSec) : []),
       // yuv420p needs even dimensions, so round the height down to an even number.
       "-vf", "scale=-2:min(720\\,trunc(ih/2)*2)",
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
@@ -116,8 +127,15 @@ export async function transcodeToHls(input: string, outDir: string, timeoutMs?: 
 }
 
 /** Mono 16 kHz MP3: small enough to send inline to an LLM (~14 MB per hour at 32 kbps). */
-export async function extractAudio(input: string, output: string, timeoutMs?: number): Promise<void> {
-  await run(FFMPEG, ["-y", ...UNTRUSTED_INPUT, "-i", input, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", output], timeoutMs);
+export async function extractAudio(input: string, output: string, timeoutMs?: number, durationSec?: number): Promise<void> {
+  await run(
+    FFMPEG,
+    [
+      "-y", ...UNTRUSTED_INPUT, "-i", input, "-map", "0:a:0", ...(durationSec ? capSeconds(durationSec) : []),
+      "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", output,
+    ],
+    timeoutMs,
+  );
 }
 
 /** Frame-accurate cut (re-encoded) so clips start exactly where the model said. */
@@ -126,8 +144,8 @@ export async function cutClip(input: string, output: string, start: number, end:
   await run(
     FFMPEG,
     [
-      "-y", ...UNTRUSTED_INPUT, "-ss", start.toFixed(3), "-i", input, "-t", (end - start).toFixed(3),
-      "-vf", "scale=-2:trunc(ih/2)*2",
+      "-y", ...UNTRUSTED_INPUT, "-ss", start.toFixed(3), "-i", input, ...MAP_FIRST_STREAMS, "-t", (end - start).toFixed(3),
+      "-vf", "scale=-2:min(720\\,trunc(ih/2)*2)",
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
       "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
       output,

@@ -7,6 +7,7 @@ import { pipeline as streamPipeline } from "node:stream/promises";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
+import { ID_RE } from "./ids.js";
 import { isTerminal, type JobEvent, JobStore } from "./jobs.js";
 import { Limiter } from "./limiter.js";
 import type { LlmProvider } from "./llm/provider.js";
@@ -20,9 +21,11 @@ export interface ServerOptions {
   maxDurationSec: number;
   maxConcurrentJobs: number;
   maxQueuedJobs: number;
+  /** Host names the server answers to (no port). Defaults to loopback names; see the README on DNS rebinding. */
+  allowedHosts?: string[];
 }
 
-const ID_RE = /^[0-9a-f-]{36}$/;
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
 // An explicit allowlist of what FFmpeg writes. `..` and anything else can never match.
 const MEDIA_RE = /^(hls\/(index\.m3u8|seg_\d{3,}\.ts)|clips\/clip-\d+\.mp4)$/;
 
@@ -42,56 +45,96 @@ export function buildServer(opts: ServerOptions): { app: FastifyInstance; store:
   const limiter = new Limiter(opts.maxConcurrentJobs, opts.maxQueuedJobs);
   const hlsJsDir = path.dirname(createRequire(import.meta.url).resolve("hls.js/dist/hls.min.js"));
 
+  // The API has no auth and is meant for localhost. A web page open in the same browser must not be able to
+  // use it: an unknown Host header means DNS rebinding, and a POST from another origin means a cross-site form.
+  const allowedHosts = new Set((opts.allowedHosts ?? LOOPBACK_HOSTS).map((h) => h.toLowerCase()));
+  app.addHook("onRequest", (req, reply, done) => {
+    const hostHeader = (req.headers.host ?? "").toLowerCase();
+    if (!allowedHosts.has(hostHeader.replace(/:\d+$/, ""))) {
+      return void reply.code(403).send({ error: "Host not allowed" });
+    }
+    const origin = req.headers.origin;
+    if (req.method === "POST" && origin !== undefined) {
+      let originHost = "";
+      try {
+        originHost = new URL(origin).host.toLowerCase();
+      } catch {
+        // "null" and junk origins stay empty and are refused below
+      }
+      if (originHost !== hostHeader) return void reply.code(403).send({ error: "Cross-site requests are not allowed" });
+    }
+    done();
+  });
+
   app.addHook("onSend", (_req, reply, payload, done) => {
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) void reply.header(name, value);
     done(null, payload);
   });
 
-  void app.register(multipart, { limits: { fileSize: opts.maxUploadBytes, files: 1 } });
+  // One file and nothing else: text fields would be buffered in memory before the file arrives.
+  void app.register(multipart, { limits: { fileSize: opts.maxUploadBytes, files: 1, fields: 0, parts: 1, headerPairs: 100 } });
   void app.register(fastifyStatic, { root: opts.publicDir });
   void app.register(fastifyStatic, { root: hlsJsDir, prefix: "/vendor/", decorateReply: false });
 
+  // Uploads that were accepted but are still streaming in. They count against the queue so that a burst of
+  // parallel uploads cannot all pass the check before any of them is queued (and fill the disk meanwhile).
+  let uploading = 0;
+
   app.post("/api/videos", async (req, reply) => {
-    if (!limiter.canAccept()) {
+    if (!limiter.canAccept(uploading)) {
       return reply.code(503).header("Retry-After", "60").send({ error: "The server is busy. Try again in a few minutes" });
     }
-    const file = await req.file();
-    if (!file) return reply.code(400).send({ error: "Send the video as multipart/form-data" });
-    // The declared type is only a quick filter: browsers report "" or octet-stream for some containers.
-    // The real check is what ffprobe finds in the content (see the pipeline).
-    const declared = file.mimetype;
-    if (declared !== "" && declared !== "application/octet-stream" && !declared.startsWith("video/")) {
-      file.file.resume();
-      return reply.code(415).send({ error: "Expected a video file" });
-    }
-
-    const id = randomUUID();
-    const dir = path.join(opts.dataDir, id);
-    await mkdir(dir, { recursive: true });
-    // The client's file name never touches the file system: FFmpeg sniffs the format from the content anyway.
-    const input = path.join(dir, "input.bin");
+    uploading++;
+    let reserved = true;
+    const release = () => {
+      if (reserved) {
+        reserved = false;
+        uploading--;
+      }
+    };
     try {
-      await streamPipeline(file.file, createWriteStream(input));
-    } catch (err) {
-      await rm(dir, { recursive: true, force: true });
-      const tooLarge = (err as { code?: string }).code === "FST_REQ_FILE_TOO_LARGE";
-      return reply.code(tooLarge ? 413 : 400).send({ error: tooLarge ? "File is larger than the upload limit" : "Upload failed" });
-    }
-    if (file.file.truncated) {
-      await rm(dir, { recursive: true, force: true });
-      return reply.code(413).send({ error: "File is larger than the upload limit" });
-    }
+      const file = await req.file();
+      if (!file) return reply.code(400).send({ error: "Send the video as multipart/form-data" });
+      // The declared type is only a quick filter: browsers report "" or octet-stream for some containers.
+      // The real check is what ffprobe finds in the content (see the pipeline).
+      const declared = file.mimetype;
+      if (declared !== "" && declared !== "application/octet-stream" && !declared.startsWith("video/")) {
+        file.file.resume();
+        return reply.code(415).send({ error: "Expected a video file" });
+      }
 
-    store.create(id);
-    void limiter.run(() =>
-      runPipeline(id, input, {
-        store,
-        provider: opts.provider,
-        dataDir: opts.dataDir,
-        maxDurationSec: opts.maxDurationSec,
-      }),
-    );
-    return reply.code(202).send({ id });
+      const id = randomUUID();
+      const dir = path.join(opts.dataDir, id);
+      await mkdir(dir, { recursive: true });
+      // The client's file name never touches the file system: FFmpeg sniffs the format from the content anyway.
+      const input = path.join(dir, "input.bin");
+      try {
+        await streamPipeline(file.file, createWriteStream(input));
+      } catch (err) {
+        await rm(dir, { recursive: true, force: true });
+        const tooLarge = (err as { code?: string }).code === "FST_REQ_FILE_TOO_LARGE";
+        return reply.code(tooLarge ? 413 : 400).send({ error: tooLarge ? "File is larger than the upload limit" : "Upload failed" });
+      }
+      if (file.file.truncated) {
+        await rm(dir, { recursive: true, force: true });
+        return reply.code(413).send({ error: "File is larger than the upload limit" });
+      }
+
+      store.create(id);
+      // `run` takes its place in the queue synchronously, so the reservation can be dropped right before it.
+      release();
+      void limiter.run(() =>
+        runPipeline(id, input, {
+          store,
+          provider: opts.provider,
+          dataDir: opts.dataDir,
+          maxDurationSec: opts.maxDurationSec,
+        }),
+      );
+      return reply.code(202).send({ id });
+    } finally {
+      release();
+    }
   });
 
   app.get<{ Params: { id: string } }>("/api/videos/:id", (req, reply) => {

@@ -12,9 +12,13 @@ export class Limiter {
     return this.waiting.length;
   }
 
-  /** False when the queue is full: the caller should answer 503 instead of accepting more work. */
-  canAccept(): boolean {
-    return this.active < this.concurrency || this.waiting.length < this.maxQueued;
+  /**
+   * False when there is no room left: the caller should answer 503 instead of accepting more work.
+   * `pending` counts work that was accepted but has not reached `run` yet (uploads still streaming in),
+   * so many parallel uploads cannot all pass the check before any of them is queued.
+   */
+  canAccept(pending = 0): boolean {
+    return this.active + this.waiting.length + pending < this.concurrency + this.maxQueued;
   }
 
   async run<T>(task: () => Promise<T>): Promise<T> {

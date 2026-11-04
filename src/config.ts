@@ -12,6 +12,8 @@ export interface Config {
   maxConcurrentJobs: number;
   maxQueuedJobs: number;
   jobTtlMs: number;
+  /** Host header values (without port) the server answers to. */
+  allowedHosts: string[];
 }
 
 /** Reads an integer env var and fails loudly on junk: `Number("abc")` is NaN and would silently disable limits. */
@@ -47,5 +49,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxConcurrentJobs: intEnv(env, "MAX_CONCURRENT_JOBS", 1, 1, 16),
     maxQueuedJobs: intEnv(env, "MAX_QUEUED_JOBS", 5, 0, 1000),
     jobTtlMs: intEnv(env, "JOB_TTL_HOURS", 24, 1, 24 * 30) * 3_600_000,
+    // Refusing unknown Host headers blocks DNS rebinding. Add your own name here if you serve it under one.
+    allowedHosts: ["localhost", "127.0.0.1", "[::1]", ...(env.ALLOWED_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean)],
   };
 }

@@ -19,6 +19,7 @@ const { app, store } = buildServer({
   maxDurationSec: config.maxDurationSec,
   maxConcurrentJobs: config.maxConcurrentJobs,
   maxQueuedJobs: config.maxQueuedJobs,
+  allowedHosts: config.allowedHosts,
 });
 
 const stopJanitor = startJanitor(store, config.dataDir, config.jobTtlMs);

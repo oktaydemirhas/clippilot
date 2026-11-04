@@ -16,10 +16,15 @@ $("form").addEventListener("submit", async (e) => {
   $("result").style.display = "none";
   const body = new FormData();
   body.append("video", file);
-  const res = await fetch("/api/videos", { method: "POST", body });
-  const json = await res.json();
-  if (!res.ok) return fail(json.error ?? "Upload failed");
-  follow(json.id);
+  try {
+    const res = await fetch("/api/videos", { method: "POST", body });
+    // A proxy or a crash can answer with something that is not JSON.
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return fail(json.error ?? "Upload failed");
+    follow(json.id);
+  } catch {
+    fail("Upload failed");
+  }
 });
 
 function fail(message) {
@@ -47,6 +52,7 @@ function follow(id) {
     source.close();
     const poll = setInterval(async () => {
       const res = await fetch(`/api/videos/${id}`).catch(() => null);
+      if (res?.status === 404) { clearInterval(poll); return fail("The job is gone (the server restarted or it expired)"); }
       if (!res || !res.ok) return;
       const job = await res.json();
       if (job.stage === "done") { clearInterval(poll); show(job); $("go").disabled = false; }
@@ -56,12 +62,14 @@ function follow(id) {
 }
 
 let asked = new Set();
+let hls;
 function show(job) {
   const r = job.result;
   $("result").style.display = "grid";
   asked = new Set();
+  hls?.destroy(); // a second upload must not leave the first player's loader running
   if (window.Hls && Hls.isSupported()) {
-    const hls = new Hls();
+    hls = new Hls();
     hls.loadSource(r.hlsUrl);
     hls.attachMedia(video);
   } else {

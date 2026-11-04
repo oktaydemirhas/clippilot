@@ -173,12 +173,46 @@ describe("upload -> HLS + analysis + clips", () => {
     expect(job.error).not.toMatch(/[\\/]/);
   });
 
-  it("refuses an HLS playlist disguised as a video instead of following its URLs", async () => {
-    const playlist = path.join(tmp, "evil.mp4");
-    await writeFile(playlist, "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\nhttp://127.0.0.1:9/x.ts\n#EXT-X-ENDLIST\n");
-    const { job } = await uploadAndWait(app, playlist);
-    expect(job.stage).toBe("failed");
-    expect(job.error).not.toContain("127.0.0.1");
+  it("refuses an HLS playlist disguised as a video: no request ever reaches the URL inside it", async () => {
+    const hits: string[] = [];
+    const target = http.createServer((req, res) => {
+      hits.push(req.url ?? "");
+      res.end();
+    });
+    await new Promise<void>((r) => target.listen(0, "127.0.0.1", r));
+    try {
+      const { port } = target.address() as { port: number };
+      const playlist = path.join(tmp, "evil.mp4");
+      await writeFile(playlist, `#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\nhttp://127.0.0.1:${port}/x.ts\n#EXT-X-ENDLIST\n`);
+      // The format whitelist is what turns it away, not a lucky failure further down.
+      await expect(probe(playlist)).rejects.toThrow(/whitelist/i);
+      const { job } = await uploadAndWait(app, playlist);
+      expect(job.stage).toBe("failed");
+      expect(hits).toEqual([]);
+    } finally {
+      await new Promise((r) => target.close(r));
+    }
+  });
+
+  it("works on the first video stream only: a huge second stream cannot slip past the resolution check", async () => {
+    const twoVideos = path.join(tmp, "two-video.mkv");
+    await run(FFMPEG, [
+      "-y",
+      "-f", "lavfi", "-i", "testsrc=duration=8:size=64x64:rate=5",
+      // FFmpeg only prefers the bigger stream when it is much bigger: 1280x720 next to 64x64 did not trigger it.
+      "-f", "lavfi", "-i", "testsrc=duration=8:size=3840x2160:rate=5",
+      "-f", "lavfi", "-i", "sine=frequency=330:duration=8",
+      "-map", "0:v", "-map", "1:v", "-map", "2:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", twoVideos,
+    ]);
+    const info = await probe(twoVideos);
+    expect([info.width, info.height]).toEqual([64, 64]); // what the pixel cap looks at
+    const { id, job } = await uploadAndWait(app, twoVideos, "application/octet-stream");
+    expect(job.stage).toBe("done");
+    // Without -map, FFmpeg encodes the 4K stream (capped to 720 high).
+    const seg = path.join(app.dataDir, id, "hls", "seg_000.ts");
+    const out = await run(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", seg]);
+    expect(Number(out.trim().split(/\s+/)[0])).toBe(64);
   });
 
   it("accepts other allowed containers (Matroska)", async () => {
@@ -275,6 +309,93 @@ describe("limits", () => {
       await waitForTerminal(app.base, id);
     } finally {
       release();
+      await app.close();
+    }
+  });
+
+  it("parallel uploads cannot all pass the capacity check before any of them is queued", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow: LlmProvider = {
+      analyze: async (audio, durationSec) => {
+        await gate;
+        return new MockProvider().analyze(audio, durationSec);
+      },
+      planClips: (a) => new MockProvider().planClips(a),
+    };
+    // Room for exactly two jobs: one running, one queued.
+    const app = await startApp(tmp, "d5", { provider: slow, maxConcurrentJobs: 1, maxQueuedJobs: 1 });
+    try {
+      const results = await Promise.all(Array.from({ length: 6 }, () => upload(app.base, sample, "p.mp4", "video/mp4")));
+      const accepted = results.filter((r) => r.status === 202);
+      expect(accepted).toHaveLength(2);
+      expect(results.filter((r) => r.status === 503)).toHaveLength(4);
+      expect(await readdir(app.dataDir)).toHaveLength(2); // the refused ones never wrote anything
+      release();
+      for (const r of accepted) await waitForTerminal(app.base, ((await r.json()) as { id: string }).id);
+    } finally {
+      release();
+      await app.close();
+    }
+  });
+
+  it("a failing second model call (planClips) keeps the finished job instead of failing it", async () => {
+    const flaky: LlmProvider = {
+      analyze: (audio, durationSec) => new MockProvider().analyze(audio, durationSec),
+      planClips: () => Promise.reject(Object.assign(new Error("rate limited at /secret/path"), { status: 429 })),
+    };
+    const app = await startApp(tmp, "d6", { provider: flaky });
+    try {
+      const { job } = await uploadAndWait(app, sample);
+      expect(job.stage).toBe("done");
+      expect(job.result.analysis.chapters.length).toBeGreaterThan(0);
+      expect(job.result.clips).toEqual([]);
+      expect(JSON.stringify(job)).not.toContain("/secret/path");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("a rejected API key fails the job with a generic message and no raw provider text", async () => {
+    let calls = 0;
+    const badKey: LlmProvider = {
+      analyze: () => {
+        calls++;
+        return Promise.reject(Object.assign(new Error("API key not valid: AIzaSECRET"), { status: 401 }));
+      },
+      planClips: () => Promise.resolve([]),
+    };
+    const app = await startApp(tmp, "d7", { provider: badKey });
+    try {
+      const { job } = await uploadAndWait(app, sample);
+      expect(job.stage).toBe("failed");
+      expect(job.error).toBe("The AI analysis failed after several attempts. Try again later");
+      expect(calls).toBe(1); // no retries for a 401
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("refuses unknown Host headers (DNS rebinding) and cross-site POSTs", async () => {
+    const app = await startApp(tmp, "d8");
+    try {
+      const { hostname, port } = new URL(app.base);
+      const send = (method: string, headers: Record<string, string>) =>
+        new Promise<number>((resolve, reject) => {
+          const req = http.request({ hostname, port, path: "/api/videos/not-an-id", method, headers }, (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          });
+          req.on("error", reject);
+          req.end();
+        });
+      expect(await send("GET", {})).toBe(404); // normal request: reaches the route
+      expect(await send("GET", { Host: "evil.example.com" })).toBe(403);
+      expect(await send("GET", { Host: `localhost:${port}` })).toBe(404);
+      expect(await send("POST", { Origin: "https://evil.example.com" })).toBe(403);
+      expect(await send("POST", { Origin: "null" })).toBe(403);
+      expect(await send("POST", { Origin: `http://127.0.0.1:${port}` })).not.toBe(403);
+    } finally {
       await app.close();
     }
   });

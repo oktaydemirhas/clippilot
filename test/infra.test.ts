@@ -62,6 +62,13 @@ describe("Limiter", () => {
     await Promise.all(runs);
   });
 
+  it("counts uploads that are still streaming in against the capacity", () => {
+    const limiter = new Limiter(1, 1); // room for two jobs in total
+    expect(limiter.canAccept(0)).toBe(true);
+    expect(limiter.canAccept(1)).toBe(true);
+    expect(limiter.canAccept(2)).toBe(false);
+  });
+
   it("keeps working after a task throws", async () => {
     const limiter = new Limiter(1, 1);
     await expect(limiter.run(() => Promise.reject(new Error("boom")))).rejects.toThrow("boom");
@@ -78,6 +85,9 @@ describe("sweep", () => {
       const fresh = "00000000-0000-4000-8000-000000000002";
       const running = "00000000-0000-4000-8000-000000000003";
       for (const id of [old, fresh, running]) await mkdir(path.join(dataDir, id));
+      // Not a job directory: an old unrelated folder must survive even if DATA_DIR points at a shared place.
+      await mkdir(path.join(dataDir, "photos"));
+      await utimes(path.join(dataDir, "photos"), new Date(0), new Date(0));
       store.create(old);
       store.complete(old, {} as never);
       store.create(running); // stays "queued"
@@ -87,7 +97,7 @@ describe("sweep", () => {
 
       const removed = await sweep(store, dataDir, 24 * 3_600_000);
       expect(removed).toEqual([old]);
-      expect((await readdir(dataDir)).sort()).toEqual([fresh, running]);
+      expect((await readdir(dataDir)).sort()).toEqual([fresh, running, "photos"]);
       expect(store.get(old)).toBeUndefined();
       expect(store.get(running)).toBeDefined();
     } finally {
