@@ -53,8 +53,9 @@ npm run lint && npm run typecheck && npm test
 | `GeminiProvider` against a fake SDK: parse failure and empty reply are returned, not thrown; retry prompt contains the previous answer; tool-call mapping | in the test suite |
 | HLS playback under the CSP in a real browser (Chromium, mock LLM) | checked manually once |
 | Real Gemini (`gemini-3.5-flash-lite`) on three videos | see "Evaluation" |
-| GitHub Actions workflow | written, **never run** (the repo has not been pushed yet) |
-| `docker build` and the compose hardening (`read_only`, `cap_drop`) | **never run**: no Docker on my machine |
+| GitHub Actions workflow (lint, typecheck, tests, build, `npm audit`) | green on the first push (2026-11-04) |
+| `docker build` | green in CI (the image builds; I have not started the container) |
+| compose hardening (`read_only`, `cap_drop`) | **never run**: no Docker on my machine |
 
 ## Evaluation
 
