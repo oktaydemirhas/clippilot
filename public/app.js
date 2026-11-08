@@ -85,6 +85,8 @@ function show(job) {
   const r = job.result;
   $("result").style.display = "grid";
   asked = new Set();
+  openQuiz = null;
+  $("quiz").style.display = "none";
   hls?.destroy(); // a second upload must not leave the first player's loader running
   if (window.Hls && Hls.isSupported()) {
     hls = new Hls();
@@ -97,6 +99,9 @@ function show(job) {
   $("chapters").replaceChildren(...r.analysis.chapters.map((c) =>
     el("li", {}, el("button", { className: "t", textContent: fmt(c.start), onclick: () => { video.currentTime = c.start; video.play(); } }),
       " ", el("strong", { textContent: c.title }), el("div", { className: "small", textContent: c.summary }))));
+  $("quizlist").replaceChildren(...r.analysis.quiz.map((q, i) =>
+    el("li", {}, el("button", { className: "t", textContent: fmt(q.at), onclick: () => { video.currentTime = q.at; showQuiz(i); } }),
+      " ", el("span", { textContent: q.question }))));
   $("clips").replaceChildren(...r.clips.map((c) =>
     el("li", {}, el("a", { href: c.url, textContent: c.title }), el("span", { className: "small", textContent: `  ${fmt(c.start)}–${fmt(c.end)}` }))));
   const notes = [`${r.analysis.quiz.length} quiz questions`, `${r.clips.length} clips`];
@@ -106,27 +111,39 @@ function show(job) {
   window.currentQuiz = r.analysis.quiz;
 }
 
-video.addEventListener("timeupdate", () => {
-  const quiz = window.currentQuiz ?? [];
-  const q = quiz.find((x, i) => !asked.has(i) && video.currentTime >= x.at && video.currentTime < x.at + 1.5);
+// openQuiz stops the timeupdate and seeking handlers from re-opening a question that is already on screen.
+let openQuiz = null;
+function showQuiz(i) {
+  const q = (window.currentQuiz ?? [])[i];
   if (!q) return;
-  asked.add(quiz.indexOf(q));
+  asked.add(i);
+  openQuiz = i;
   video.pause();
   const box = $("quiz").firstElementChild;
   const note = el("p", { textContent: "" });
   box.replaceChildren(el("h3", { textContent: q.question }));
-  q.options.forEach((text, i) => {
+  q.options.forEach((text, j) => {
     const b = el("button", { className: "opt", textContent: text });
     b.onclick = () => {
-      box.querySelectorAll(".opt").forEach((o, j) => { o.disabled = true; if (j === q.answerIndex) o.classList.add("right"); });
-      if (i !== q.answerIndex) b.classList.add("wrong");
+      box.querySelectorAll(".opt").forEach((o, k) => { o.disabled = true; if (k === q.answerIndex) o.classList.add("right"); });
+      if (j !== q.answerIndex) b.classList.add("wrong");
       note.textContent = q.explanation;
-      box.append(el("button", { className: "ghost", textContent: "Continue", onclick: () => { $("quiz").style.display = "none"; video.play(); } }));
+      box.append(el("button", { className: "ghost", textContent: "Continue", onclick: () => { $("quiz").style.display = "none"; openQuiz = null; video.play(); } }));
     };
     box.append(b);
   });
   box.append(note);
   $("quiz").style.display = "flex";
+}
+
+video.addEventListener("timeupdate", () => {
+  if (openQuiz !== null) return;
+  const quiz = window.currentQuiz ?? [];
+  const i = quiz.findIndex((x, k) => !asked.has(k) && video.currentTime >= x.at && video.currentTime < x.at + 1.5);
+  if (i >= 0) showQuiz(i);
 });
 
-video.addEventListener("seeking", () => { asked = new Set([...asked].filter((i) => (window.currentQuiz[i]?.at ?? 0) < video.currentTime - 1.5)); });
+// Seeking back makes later questions ask again. The one on screen stays marked, or "Continue" would reopen it.
+video.addEventListener("seeking", () => {
+  asked = new Set([...asked].filter((i) => i === openQuiz || (window.currentQuiz[i]?.at ?? 0) < video.currentTime - 1.5));
+});
