@@ -14,6 +14,8 @@ $("form").addEventListener("submit", async (e) => {
   $("go").disabled = true;
   $("steps").replaceChildren();
   $("result").style.display = "none";
+  $("progress").classList.remove("on", "failed", "done");
+  setProgress(0, "Uploading");
   const body = new FormData();
   body.append("video", file);
   try {
@@ -27,7 +29,20 @@ $("form").addEventListener("submit", async (e) => {
   }
 });
 
+// `message` is empty for a pure progress tick, which only moves the bar.
+function setProgress(percent, message, state) {
+  const bar = $("progress");
+  bar.classList.add("on");
+  bar.classList.toggle("failed", state === "failed");
+  bar.classList.toggle("done", state === "done");
+  bar.setAttribute("aria-valuenow", String(percent));
+  $("fill").style.width = `${percent}%`;
+  $("pct-text").textContent = `${percent}%`;
+  if (message) $("pct-msg").textContent = message;
+}
+
 function fail(message) {
+  $("progress").classList.add("failed");
   $("steps").append(el("li", { className: "failed", textContent: message }));
   $("go").disabled = false;
 }
@@ -36,6 +51,8 @@ function follow(id) {
   const source = new EventSource(`/api/videos/${id}/events`);
   source.onmessage = async (msg) => {
     const ev = JSON.parse(msg.data);
+    setProgress(ev.percent ?? 0, ev.message, ev.stage === "done" || ev.stage === "failed" ? ev.stage : undefined);
+    if (ev.message === "") return; // a progress tick: the bar is all it changes
     $("steps").querySelectorAll("li.last").forEach((li) => li.classList.remove("last"));
     $("steps").append(el("li", { className: ev.stage === "failed" ? "failed" : "last", textContent: ev.message }));
     if (ev.stage === "done") {
@@ -55,6 +72,7 @@ function follow(id) {
       if (res?.status === 404) { clearInterval(poll); return fail("The job is gone (the server restarted or it expired)"); }
       if (!res || !res.ok) return;
       const job = await res.json();
+      setProgress(job.percent ?? 0, undefined, job.stage === "done" || job.stage === "failed" ? job.stage : undefined);
       if (job.stage === "done") { clearInterval(poll); show(job); $("go").disabled = false; }
       if (job.stage === "failed") { clearInterval(poll); fail(job.error ?? "Processing failed"); }
     }, 2000);

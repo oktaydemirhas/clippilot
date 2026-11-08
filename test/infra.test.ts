@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { progressReader } from "../src/ffmpeg.js";
 import { sweep } from "../src/janitor.js";
 import { JobStore } from "../src/jobs.js";
 import { Limiter } from "../src/limiter.js";
@@ -26,6 +27,40 @@ describe("loadConfig", () => {
   it("requires a key for gemini and rejects unknown providers", () => {
     expect(() => loadConfig({})).toThrow(/GEMINI_API_KEY/);
     expect(() => loadConfig({ LLM_PROVIDER: "openai" })).toThrow(/LLM_PROVIDER/);
+  });
+});
+
+describe("progressReader", () => {
+  it("turns FFmpeg -progress lines into a fraction, even when a line is split across chunks", () => {
+    const seen: number[] = [];
+    const read = progressReader(10, (f) => seen.push(f));
+    read("frame=10\nout_time_us=2500");
+    read("000\nspeed=1x\nout_time_ms=5000000\nprogress=continue\n");
+    read("out_time_us=99000000\n"); // past the end: capped
+    expect(seen).toEqual([0.25, 0.5, 1]);
+  });
+
+  it("ignores lines it does not understand", () => {
+    const seen: number[] = [];
+    progressReader(10, (f) => seen.push(f))("out_time=00:00:02.5\nout_time_us=N/A\nbitrate=1kbits/s\n");
+    expect(seen).toEqual([]);
+  });
+});
+
+describe("JobStore progress", () => {
+  it("never goes backwards, never reaches 100 before the job is done, and is not kept in the history", () => {
+    const store = new JobStore();
+    store.create("a");
+    store.update("a", "transcoding", "Transcoding", 5);
+    store.progress("a", 30);
+    store.progress("a", 20); // older value arriving late
+    store.progress("a", 250);
+    expect(store.get("a")!.percent).toBe(99);
+    expect(store.get("a")!.events.map((e) => e.percent)).toEqual([0, 5]);
+    store.complete("a", {} as never);
+    expect(store.get("a")!.percent).toBe(100);
+    store.progress("a", 50);
+    expect(store.get("a")!.percent).toBe(100);
   });
 });
 

@@ -21,7 +21,7 @@ const UNTRUSTED_INPUT = ["-protocol_whitelist", "file", "-format_whitelist", ALL
  * Runs a binary without a shell and without blocking the event loop.
  * Keeps only the tail of stderr so a long encode cannot exhaust memory, and kills the process on timeout.
  */
-export function run(bin: string, args: string[], timeoutMs = 30 * 60_000): Promise<string> {
+export function run(bin: string, args: string[], timeoutMs = 30 * 60_000, onStdout?: (text: string) => void): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
@@ -31,7 +31,8 @@ export function run(bin: string, args: string[], timeoutMs = 30 * 60_000): Promi
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    // With a listener, stdout is a stream of progress lines: hand them over instead of collecting them.
+    child.stdout.on("data", (d: Buffer) => (onStdout ? onStdout(d.toString()) : (out += d.toString())));
     child.stderr.on("data", (d: Buffer) => (err = (err + d.toString()).slice(-4000)));
     child.on("error", (e) => {
       clearTimeout(timer);
@@ -102,14 +103,40 @@ const MAP_FIRST_STREAMS = ["-map", "0:V:0", "-map", "0:a:0"];
 /** Output cap: the container header's duration is a claim, not a guarantee. */
 const capSeconds = (durationSec: number): string[] => ["-t", String(Math.ceil(durationSec) + 1)];
 
+/**
+ * Turns FFmpeg's `-progress` output into a fraction of the video done (0-1).
+ * Lines arrive in arbitrary chunks, so incomplete lines are kept until their newline shows up.
+ */
+export function progressReader(durationSec: number, onFraction: (fraction: number) => void): (text: string) => void {
+  let pending = "";
+  return (text) => {
+    pending += text;
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      // out_time_ms is in microseconds despite its name; out_time_us is the same value where it exists.
+      const m = /^out_time_(?:us|ms)=(\d+)/.exec(line.trim());
+      if (m) onFraction(Math.min(1, Number(m[1]) / 1e6 / durationSec));
+    }
+  };
+}
+
 /** Single-rendition VOD HLS capped at 720p. Returns the playlist path. */
-export async function transcodeToHls(input: string, outDir: string, timeoutMs?: number, durationSec?: number): Promise<string> {
+export async function transcodeToHls(
+  input: string,
+  outDir: string,
+  timeoutMs?: number,
+  durationSec?: number,
+  onFraction?: (fraction: number) => void,
+): Promise<string> {
   await mkdir(outDir, { recursive: true });
   const playlist = path.join(outDir, "index.m3u8");
+  const reader = onFraction && durationSec ? progressReader(durationSec, onFraction) : undefined;
   await run(
     FFMPEG,
     [
-      "-y", ...UNTRUSTED_INPUT, "-i", input, ...MAP_FIRST_STREAMS,
+      "-y", ...(reader ? ["-nostats", "-progress", "pipe:1"] : []),
+      ...UNTRUSTED_INPUT, "-i", input, ...MAP_FIRST_STREAMS,
       ...(durationSec ? capSeconds(durationSec) : []),
       // yuv420p needs even dimensions, so round the height down to an even number.
       "-vf", "scale=-2:min(720\\,trunc(ih/2)*2)",
@@ -122,6 +149,7 @@ export async function transcodeToHls(input: string, outDir: string, timeoutMs?: 
       playlist,
     ],
     timeoutMs,
+    reader,
   );
   return playlist;
 }

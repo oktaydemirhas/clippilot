@@ -1,7 +1,7 @@
 # ClipPilot: decisions and lessons
 
 ## State (2026-11-04)
-- Lint, typecheck, build and 51 tests pass locally. A second review round (Opus + security audit) was fixed on top of the first push; see the README "Independent review". Real FFmpeg end-to-end tests run with a mock LLM; `GeminiProvider` is tested against a fake SDK.
+- Lint, typecheck, build and 55 tests pass locally. A second review round (Opus + security audit) was fixed on top of the first push; see the README "Independent review". Real FFmpeg end-to-end tests run with a mock LLM; `GeminiProvider` is tested against a fake SDK.
 - Real Gemini (`gemini-3.5-flash-lite`) runs on three Turkish videos (2:39, 5:16 no speech, 16:52) all finish after the hardening round. One run each, see the README "Evaluation".
 - CI (lint, typecheck, tests, build, audit) and `docker build` were green on the first push, 2026-11-04. The container itself and the compose hardening have never been started.
 - Not done: English or noisy audio, videos over 17 min, any measurement of timestamp correctness.

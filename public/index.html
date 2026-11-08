@@ -15,6 +15,11 @@
   button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
   button:disabled { opacity:.5; cursor:default; }
   input[type=file] { color:var(--mute); }
+  #progress { display:none; margin-top:14px; } #progress.on { display:block; }
+  #track { height:10px; background:var(--line); border-radius:999px; overflow:hidden; }
+  #fill { height:100%; width:0; background:var(--accent); border-radius:999px; transition:width .35s ease; }
+  #progress.failed #fill { background:var(--bad); } #progress.done #fill { background:var(--ok); }
+  #pct { display:flex; justify-content:space-between; margin-top:6px; font-size:13px; color:var(--mute); font-variant-numeric:tabular-nums; }
   #steps { list-style:none; padding:0; margin:12px 0 0; } #steps li { color:var(--mute); padding:2px 0; }
   #steps li.last { color:var(--text); } #steps li.failed { color:var(--bad); }
   #result { display:none; margin-top:20px; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:16px; }
@@ -39,6 +44,10 @@
 
   <div class="panel">
     <form id="form"><input id="file" type="file" accept="video/*" required> <button id="go" type="submit">Analyse</button></form>
+    <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="track"><div id="fill"></div></div>
+      <div id="pct"><span id="pct-text">0%</span><span id="pct-msg"></span></div>
+    </div>
     <ul id="steps"></ul>
   </div>
 

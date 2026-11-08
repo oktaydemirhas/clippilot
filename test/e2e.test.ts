@@ -133,6 +133,20 @@ describe("upload -> HLS + analysis + clips", () => {
     }
   });
 
+  it("reports a percentage that only goes up and ends at exactly 100 when the job is done", async () => {
+    const res = await upload(app.base, sample, "p.mp4", "video/mp4");
+    const { id } = (await res.json()) as { id: string };
+    const text = await (await fetch(`${app.base}/api/videos/${id}/events`)).text();
+    const events = [...text.matchAll(/data: (.*)\n\n/g)].map((m) => JSON.parse(m[1]!) as { stage: string; percent: number; message: string });
+    const percents = events.map((e) => e.percent);
+    expect(percents.every((p) => p >= 0 && p <= 100)).toBe(true);
+    expect(percents).toEqual([...percents].sort((a, b) => a - b));
+    const last = events.at(-1)!;
+    expect([last.stage, last.percent]).toEqual(["done", 100]);
+    expect(percents.filter((p) => p === 100)).toHaveLength(1); // ticks never claim 100 early
+    expect(((await (await fetch(`${app.base}/api/videos/${id}`)).json()) as { percent: number }).percent).toBe(100);
+  });
+
   it("deletes the original upload and the extracted audio once the job has finished", async () => {
     const { id } = await uploadAndWait(app, sample);
     const files = await readdir(path.join(app.dataDir, id));

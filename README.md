@@ -16,7 +16,7 @@ POST /api/videos  ->  202 { id }            (503 when the queue is full, 413 whe
                        |
         probe -> transcode to HLS -> extract audio -> LLM analysis -> LLM picks clips -> FFmpeg cuts
                        |
-GET  /api/videos/:id/events   (Server-Sent Events: live progress)
+GET  /api/videos/:id/events   (Server-Sent Events: live progress with a percentage)
 GET  /api/videos/:id          (job state + result)
 GET  /media/:id/hls/...       (playlist + segments)   GET /media/:id/clips/...   (mp4 clips)
 ```
@@ -26,6 +26,7 @@ GET  /media/:id/hls/...       (playlist + segments)   GET /media/:id/clips/...  
 - **Model output is never trusted** (`src/analyze.ts`, `src/schema.ts`). Every answer must pass a zod schema *and* semantic checks (timestamps inside the video, chapters in order, clip lengths sane, no quiz when there is no speech). The JSON Schema generated from the zod schema is also enforced by the Gemini API. A rejected answer goes back to the model together with the rejected JSON and the exact reasons, up to 3 attempts. A provider that throws or returns text that is not JSON counts as a rejected attempt. Failed requests (network, timeout, 429, 5xx) wait with exponential backoff and jitter; a 4xx such as a bad API key fails at once instead of burning three requests. The raw provider error is only logged: it can contain server paths or API response bodies.
 - **Tool calls are validated too** (`src/clips.ts`). The model may only call `cut_clip`; its arguments are checked for bounds, length and count before anything reaches FFmpeg. Rejections are reported, and neither a failed cut nor a failed second model call (rate limit, timeout) fails the whole job: the HLS output and the analysis are kept. The second model call only sees the first call's highlight list (not the audio), so it is a re-ranking and trimming step, not an autonomous agent loop. The mock does not simulate function calling.
 - **Untrusted uploads.** The file name is never used on disk. FFmpeg and ffprobe run with a protocol whitelist (`file` only) and a demuxer whitelist (MP4/MOV/MKV/WebM/AVI), so an HLS playlist disguised as a video is refused as a format. (FFmpeg already blocks `http` inside a playlist opened from a file by default; the whitelists make that explicit and add the format check.) FFmpeg is told which streams to use (`-map 0:V:0 -map 0:a:0`), because by default it prefers the largest video stream while the resolution cap looks at the first one, and output is cut at the probed duration (`-t`), because a header can claim less than the file holds. The original upload and the extracted audio are deleted when a job ends, partial uploads are removed, and only HLS files and clips with server-generated names are public.
+- **Progress bar.** The percentage is real for the FFmpeg transcode (read from `-progress`); the other steps have fixed ranges. While the model thinks the bar waits at 70%, because no honest number exists for that. It never goes backwards and never shows 100 before the job is done. Temporary files are deleted before the final event, so a client that sees "done" also sees them gone.
 - **Limits** (`.env.example`): upload size, video length (45 min default), one job at a time with a short queue (503 when full; uploads still streaming in count against it), one file and no text fields per upload, 4K pixel cap, FFmpeg and model-call timeouts, job directories deleted after 24 h (only directories whose name is a job id). The server listens on loopback by default, answers only to loopback `Host` names (DNS rebinding; add yours with `ALLOWED_HOSTS`), and refuses POSTs from another origin.
 - **Self-hosted hls.js and a strict CSP**, no inline scripts, model text is only ever rendered with `textContent`.
 
@@ -47,7 +48,7 @@ npm run lint && npm run typecheck && npm test
 
 | Check | Status |
 | --- | --- |
-| Lint, typecheck, 51 tests | passing locally (Windows, Node 24) |
+| Lint, typecheck, 55 tests | passing locally (Windows, Node 24) |
 | Real FFmpeg end to end: upload -> HLS (4 s segments) -> clips with the expected duration, odd-height video, Matroska, no-speech recording, no-audio video (mock LLM) | in the test suite |
 | Attacks: literal `..` paths (raw HTTP, not `fetch`), disguised HLS playlist (a local listener receives zero requests), a hidden 4K second video stream, text file claiming `video/mp4`, oversize upload leaves no partial file, queue full -> 503 (also for parallel uploads), foreign `Host` / `Origin` -> 403 | in the test suite |
 | Retry policy: backoff, fail-fast on 401, raw provider text kept out of the job record; a failing `planClips` keeps the finished job | in the test suite |
